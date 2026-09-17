@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=%i
-WorkingDirectory=%h/lab-pi/Audio
-ExecStart=%h/lab-pi/venv/bin/python3 %h/lab-pi/Audio/server.py
+WorkingDirectory=__PROJECT_DIR__/Audio
+ExecStart=__PROJECT_DIR__/venv/bin/python3 __PROJECT_DIR__/Audio/server.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

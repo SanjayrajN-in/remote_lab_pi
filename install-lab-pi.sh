@@ -458,7 +458,7 @@ fi
 
 if [ -f "$PROJECT_DIR/systemd/audio_stream.service" ]; then
     sudo cp "$PROJECT_DIR/systemd/audio_stream.service" /etc/systemd/system/
-    sudo sed -i "s|%h|$CURRENT_HOME|g" /etc/systemd/system/audio_stream.service
+    sudo sed -i "s|__PROJECT_DIR__|$PROJECT_DIR|g" /etc/systemd/system/audio_stream.service
     sudo sed -i "s|%i|$CURRENT_USER|g" /etc/systemd/system/audio_stream.service
     echo "Copied and configured audio_stream.service"
 fi
