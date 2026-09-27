@@ -39,11 +39,11 @@ import subprocess
 import eventlet
 eventlet.monkey_patch()
 
-import os, time, subprocess, threading, queue, tempfile, re, random, json, math, asyncio, hmac
+import os, time, subprocess, threading, queue, tempfile, re, random, json, math, asyncio, hmac, functools
 import numpy as np
 from scipy.signal import medfilt, savgol_filter
 import requests
-from flask import Flask, send_from_directory, request, jsonify, render_template, abort, session, redirect, url_for
+from flask import Flask, send_from_directory, request, jsonify, render_template, abort, session, redirect, url_for, copy_current_request_context
 from flask_socketio import SocketIO, emit
 
 # Optional: serial usage guarded (so app still runs if pyserial not available)
@@ -176,7 +176,12 @@ os.makedirs(DEBUG_UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 app.config['SECRET_KEY'] = get_or_create_secret_key()
-socketio = SocketIO(app, async_mode='eventlet')
+# async_handlers=False: each client's events run one at a time, in arrival
+# order. With the default (a new green thread per event) a send_command press
+# and release arriving milliseconds apart could reach the serial port swapped.
+# Handlers must therefore stay quick — slow work (flashing, GDB/OpenOCD) runs
+# in a background task instead so it doesn't hold up later commands.
+socketio = SocketIO(app, async_mode='eventlet', async_handlers=False)
 
 # Global active sessions for authorization
 active_sessions = {}
@@ -2078,6 +2083,31 @@ def _emit_debug_event(payload):
     socketio.emit('debug_event', payload)
 
 
+# Debug handlers can block for seconds (OpenOCD startup, GDB round trips,
+# reset retries), which with async_handlers=False would stall the student's
+# serial commands behind them. They're queued to one worker instead, so they
+# stay off the socket loop but still run in the order they were sent.
+_debug_jobs = eventlet.queue.Queue()
+
+
+def _debug_worker():
+    while True:
+        job = _debug_jobs.get()
+        try:
+            job()
+        except Exception as e:
+            print(f"[Debug] Unhandled error in debug job: {e}")
+
+
+def _debug_job(handler):
+    """Run a socket handler on the debug worker. The request context is
+    copied so emit() still replies to the sender."""
+    @functools.wraps(handler)
+    def wrapper(*args):
+        _debug_jobs.put(copy_current_request_context(lambda: handler(*args)))
+    return wrapper
+
+
 def _teardown_debug_session():
     global _debug_gdb, _debug_openocd
     if _debug_gdb is not None:
@@ -2095,6 +2125,7 @@ def _teardown_debug_session():
 
 
 @socketio.on('debug_start')
+@_debug_job
 def handle_debug_start(data):
     global _debug_gdb, _debug_openocd
     data = data or {}
@@ -2150,12 +2181,14 @@ def handle_debug_start(data):
 
 
 @socketio.on('debug_stop')
+@_debug_job
 def handle_debug_stop(data=None):
     _teardown_debug_session()
     emit('debug_event', {'event': 'session_stopped'})
 
 
 @socketio.on('debug_load_symbols')
+@_debug_job
 def handle_debug_load_symbols(data=None):
     # Always the fixed path from debug_upload_elf() -- never a client-supplied
     # path (students have no visibility into this Pi's filesystem to type one).
@@ -2173,6 +2206,7 @@ def handle_debug_load_symbols(data=None):
 
 
 @socketio.on('debug_command')
+@_debug_job
 def handle_debug_command(data):
     data = data or {}
     if _debug_gdb is None:
@@ -2237,6 +2271,7 @@ if __name__ == '__main__':
     
     # Start Oscilloscope worker
     eventlet.spawn(osc_worker)
+    eventlet.spawn(_debug_worker)
 
     # Auto-connect any admin-configured serial port profiles
     print("[Serial] Syncing admin-configured serial port profiles...")
