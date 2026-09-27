@@ -936,6 +936,7 @@ function createControlElement(cfg){
   if(cfg.locked){
     wrapper.classList.add('locked-control');
     wrapper.dataset.requiredId = cfg.requiredId || '';
+    wrapper.dataset.requiredSig = cfg.requiredSig || '';
     wrapper.style.borderColor = '#00f0ff88';
   }
 
@@ -1014,14 +1015,42 @@ else if(cfg.type === 'button'){
   btn.setAttribute('data-on-cmd', onCmd);
   btn.setAttribute('data-off-cmd', offCmd);
 
-  let toggled = false;
-  btn.onclick = () => {
-    toggled = !toggled;
-    btn.style.opacity = toggled ? '0.7' : '1';
-    const cmd = toggled ? onCmd : offCmd;
-    // cfg.portId locks this control to a specific board; blank = primary target.
-    socket.emit('send_command', cfg.portId ? { cmd, conn_id: cfg.portId } : { cmd });  // ✅ sends only what you typed, e.g. "1" or "0"
-  };
+  // cfg.portId locks this control to a specific board; blank = primary target.
+  const sendCmd = (cmd) => socket.emit('send_command', cfg.portId ? { cmd, conn_id: cfg.portId } : { cmd });  // ✅ sends only what you typed, e.g. "1" or "0"
+
+  if (cfg.buttonMode === 'momentary') {
+    // Hold-to-activate: pressCmd on press, releaseCmd once when let go
+    // (pointer up, dragged off, cancelled, or the window losing focus).
+    const pressCmd = cfg.pressCmd !== undefined ? cfg.pressCmd : '1';
+    const releaseCmd = cfg.releaseCmd !== undefined ? cfg.releaseCmd : '0';
+    let pressed = false;
+    const release = () => {
+      if (!pressed) return;
+      pressed = false;
+      btn.style.opacity = '1';
+      sendCmd(releaseCmd);
+    };
+    btn.style.touchAction = 'none';
+    btn.addEventListener('pointerdown', (e) => {
+      if (pressed) return;
+      pressed = true;
+      btn.setPointerCapture(e.pointerId);
+      btn.style.opacity = '0.7';
+      sendCmd(pressCmd);
+    });
+    btn.addEventListener('pointerup', release);
+    btn.addEventListener('pointercancel', release);
+    btn.addEventListener('lostpointercapture', release);
+    window.addEventListener('blur', release);
+    btn.addEventListener('contextmenu', (e) => e.preventDefault());
+  } else {
+    let toggled = false;
+    btn.onclick = () => {
+      toggled = !toggled;
+      btn.style.opacity = toggled ? '0.7' : '1';
+      sendCmd(toggled ? onCmd : offCmd);
+    };
+  }
   content.appendChild(btn);
 }
 
@@ -1059,11 +1088,15 @@ function renderRequiredControls(list) {
   dynamicControls.querySelectorAll('.locked-control').forEach(row => {
     if (!incomingIds.has(row.dataset.requiredId)) row.remove();
   });
-  const existingIds = new Set(Array.from(dynamicControls.querySelectorAll('.locked-control')).map(row => row.dataset.requiredId));
+  const existingRows = new Map(Array.from(dynamicControls.querySelectorAll('.locked-control')).map(row => [row.dataset.requiredId, row]));
   (list || []).forEach(cfg => {
-    if (!existingIds.has(cfg.id)) {
-      createControlElement(Object.assign({}, cfg, { locked: true, requiredId: cfg.id }));
-    }
+    // Signature of the saved config, so an admin edit (same id, e.g. toggle ->
+    // momentary) rebuilds the row in place instead of being ignored.
+    const sig = JSON.stringify(cfg);
+    const oldRow = existingRows.get(cfg.id);
+    if (oldRow && oldRow.dataset.requiredSig === sig) return;
+    createControlElement(Object.assign({}, cfg, { locked: true, requiredId: cfg.id, requiredSig: sig }));
+    if (oldRow) oldRow.replaceWith(dynamicControls.lastElementChild);
   });
 }
 

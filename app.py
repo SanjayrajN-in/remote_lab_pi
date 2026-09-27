@@ -1090,6 +1090,12 @@ def _required_control_from_form(form):
     elif rc_type == 'button':
         control['onCmd'] = form.get('rc_on_cmd', '1')
         control['offCmd'] = form.get('rc_off_cmd', '0')
+        # 'toggle' (default) flips between onCmd/offCmd per click; 'momentary'
+        # sends pressCmd while held down and releaseCmd when let go.
+        mode = form.get('rc_button_mode', 'toggle')
+        control['buttonMode'] = mode if mode in ('toggle', 'momentary') else 'toggle'
+        control['pressCmd'] = form.get('rc_press_cmd', '1')
+        control['releaseCmd'] = form.get('rc_release_cmd', '0')
     elif rc_type == 'readout':
         control['dataKey'] = (form.get('rc_data_key') or label.lower().replace(' ', '_')).strip()
         # 'unit' is a LaTeX source string (e.g. ^\circ\text{C}), rendered client-side with KaTeX.

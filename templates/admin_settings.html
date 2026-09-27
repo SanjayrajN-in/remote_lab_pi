@@ -230,8 +230,17 @@ button{padding:9px 16px;border-radius:6px;border:none;cursor:pointer;background:
           </div>
           <div class="row"><label>Command format</label><input type="text" name="rc_cmd_format" value="{{ c.cmdFormat }}" style="width:140px"></div>
           {% elif c.type == 'button' %}
+          <div class="row"><label>Mode</label>
+            <select name="rc_button_mode">
+              <option value="toggle" {{ 'selected' if c.buttonMode != 'momentary' }}>Toggle</option>
+              <option value="momentary" {{ 'selected' if c.buttonMode == 'momentary' }}>Momentary (hold)</option>
+            </select>
+          </div>
           <div class="row"><label>On command</label><input type="text" name="rc_on_cmd" value="{{ c.onCmd }}" style="width:140px"></div>
           <div class="row"><label>Off command</label><input type="text" name="rc_off_cmd" value="{{ c.offCmd }}" style="width:140px"></div>
+          <div class="row"><label>Press command</label><input type="text" name="rc_press_cmd" value="{{ c.pressCmd if c.pressCmd is defined else '1' }}" style="width:140px"></div>
+          <div class="row"><label>Release command</label><input type="text" name="rc_release_cmd" value="{{ c.releaseCmd if c.releaseCmd is defined else '0' }}" style="width:140px"></div>
+          <p class="note">Toggle uses On/Off; Momentary uses Press/Release.</p>
           {% elif c.type == 'readout' %}
           <div class="row"><label>Data key</label><input type="text" name="rc_data_key" value="{{ c.dataKey }}" style="width:160px"></div>
           <div class="row"><label>Unit (LaTeX)</label><input type="text" name="rc_unit" value="{{ c.unit }}" style="width:140px"></div>
@@ -281,8 +290,17 @@ button{padding:9px 16px;border-radius:6px;border:none;cursor:pointer;background:
         <p class="note">Use <code>{value}</code> as the placeholder, e.g. <code>{value}</code>, <code>I{value}</code>, or <code>{value}A</code>.</p>
       </div>
       <div id="rc_fields_button" class="rc-fields" style="display:none">
+        <div class="row"><label for="rc_button_mode">Mode</label>
+          <select id="rc_button_mode" name="rc_button_mode">
+            <option value="toggle">Toggle</option>
+            <option value="momentary">Momentary (hold)</option>
+          </select>
+        </div>
         <div class="row"><label for="rc_on_cmd">On command</label><input type="text" id="rc_on_cmd" name="rc_on_cmd" value="1" style="width:140px"></div>
         <div class="row"><label for="rc_off_cmd">Off command</label><input type="text" id="rc_off_cmd" name="rc_off_cmd" value="0" style="width:140px"></div>
+        <div class="row"><label for="rc_press_cmd">Press command</label><input type="text" id="rc_press_cmd" name="rc_press_cmd" value="1" style="width:140px"></div>
+        <div class="row"><label for="rc_release_cmd">Release command</label><input type="text" id="rc_release_cmd" name="rc_release_cmd" value="0" style="width:140px"></div>
+        <p class="note">Toggle uses On/Off; Momentary uses Press/Release.</p>
       </div>
       <div id="rc_fields_readout" class="rc-fields" style="display:none">
         <div class="row"><label for="rc_data_key">Data key</label><input type="text" id="rc_data_key" name="rc_data_key" placeholder="e.g. temperature" style="width:160px"></div>
