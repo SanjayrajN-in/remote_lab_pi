@@ -28,6 +28,11 @@ import requests
 import threading
 from datetime import datetime
 
+def _authed_get(url, **kw):
+    kw.setdefault('headers', {})['X-Master-Api-Key'] = os.environ.get('MASTER_API_KEY', '')
+    return requests.get(url, **kw)
+
+
 # Configuration - reads from environment or .env file
 # Default to localhost for testing
 ADMIN_PI_URL = os.environ.get('ADMIN_PI_URL', 'http://127.0.0.1:5000')
@@ -89,7 +94,7 @@ class SessionPoller:
         """Poll Admin Pi for active session"""
         try:
             url = f"{self.admin_url}/api/lab-pi/{self.lab_pi_id}/active-session"
-            response = requests.get(url, timeout=5)
+            response = _authed_get(url, timeout=5)
             
             if response.status_code == 200:
                 data = response.json()

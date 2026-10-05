@@ -487,9 +487,9 @@ echo -e "${YELLOW}Step 12: Setting up UPS monitoring service...${NC}"
 if [ -f "$PROJECT_DIR/systemd/dfrobot-ups.service" ]; then
     sudo cp "$PROJECT_DIR/systemd/dfrobot-ups.service" /etc/systemd/system/
     echo "Copied dfrobot-ups.service"
-    
+
     # Update the service file with correct paths
-    sudo sed -i "s|%h|$CURRENT_HOME|g" /etc/systemd/system/dfrobot-ups.service
+    sudo sed -i "s|__PROJECT_DIR__|$PROJECT_DIR|g" /etc/systemd/system/dfrobot-ups.service
     sudo sed -i "s|%i|$CURRENT_USER|g" /etc/systemd/system/dfrobot-ups.service
     sudo chmod 644 /etc/systemd/system/dfrobot-ups.service
     

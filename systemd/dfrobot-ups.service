@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=%i
-WorkingDirectory=%h/lab-pi
-ExecStart=/usr/bin/python3 %h/lab-pi/dfrobot_ups.py
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=/usr/bin/python3 __PROJECT_DIR__/dfrobot_ups.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
