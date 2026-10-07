@@ -39,7 +39,7 @@ import subprocess
 import eventlet
 eventlet.monkey_patch()
 
-import os, time, subprocess, threading, queue, tempfile, re, random, json, math, asyncio, hmac, functools
+import os, time, subprocess, threading, queue, tempfile, re, random, json, math, asyncio, hmac, functools, collections, glob
 import numpy as np
 from scipy.signal import medfilt, savgol_filter
 import requests
@@ -1556,18 +1556,107 @@ def debug_upload_elf():
     return jsonify({'status': 'ok', 'filename': secure_filename(elf.filename)})
 
 
+FLASH_TIMEOUT_SEC = 90
+# OpenOCD output that means the probe/flash failed even if it exited 0.
+# ("Error: SRST error" is normal for the Tiva ICDI and deliberately not here.)
+_FLASH_FAILURE_PATTERNS = ('Error TX Data', 'open failed')
+# TI Stellaris/Tiva In-Circuit Debug Interface (EK-TM4C123GXL onboard probe)
+_ICDI_USB_ID = ('1cbe', '00fd')
+
+
+def _usb_reset_icdi():
+    """Software-replug a wedged ICDI probe (USBDEVFS_RESET) so the next
+    OpenOCD can talk to it. Needs write access to /dev/bus/usb/BBB/DDD,
+    which the plugdev group has via 60-openocd.rules -- no sudo. Only
+    resets when exactly one ICDI is attached, so it never knocks another
+    board's probe off the bus. Returns (ok, human-readable message)."""
+    import fcntl
+    USBDEVFS_RESET = 0x5514  # _IO('U', 20)
+    matches = []
+    for dev in glob.glob('/sys/bus/usb/devices/*'):
+        try:
+            with open(os.path.join(dev, 'idVendor')) as f:
+                vid = f.read().strip()
+            with open(os.path.join(dev, 'idProduct')) as f:
+                pid = f.read().strip()
+            if (vid, pid) != _ICDI_USB_ID:
+                continue
+            with open(os.path.join(dev, 'busnum')) as f:
+                bus = int(f.read())
+            with open(os.path.join(dev, 'devnum')) as f:
+                devnum = int(f.read())
+            matches.append(f'/dev/bus/usb/{bus:03d}/{devnum:03d}')
+        except (OSError, ValueError):
+            continue
+    if len(matches) != 1:
+        return False, f'USB reset skipped: found {len(matches)} ICDI probes (need exactly 1)'
+    try:
+        fd = os.open(matches[0], os.O_WRONLY)
+        try:
+            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return False, f'USB reset of {matches[0]} failed: {e}'
+    # Give the probe time to re-enumerate before OpenOCD opens it again.
+    eventlet.sleep(2)
+    return True, f'USB reset of ICDI probe {matches[0]} OK'
+
+
+def _run_flash_once(cmd):
+    """Run one flash attempt, streaming output.
+    Returns (rc, timed_out, failure_pattern_or_None, last_output_lines)."""
+    tail = collections.deque(maxlen=15)
+    hit = None
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    timed_out = False
+    try:
+        with eventlet.Timeout(FLASH_TIMEOUT_SEC):
+            for line in iter(p.stdout.readline, ''):
+                if line is None:
+                    continue
+                line = line.strip()
+                tail.append(line)
+                if hit is None:
+                    hit = next((pat for pat in _FLASH_FAILURE_PATTERNS if pat in line), None)
+                socketio.emit('flashing_status', line)
+            p.wait()
+    except eventlet.Timeout:
+        timed_out = True
+        p.kill()
+        p.wait()
+    return p.returncode, timed_out, hit, list(tail)
+
+
 def run_flash_command(cmd, filename=None):
     try:
+        # The debugger's OpenOCD holds the same probe the flasher needs.
+        _release_debug_probe('flashing firmware')
         socketio.emit('flashing_status', f"Starting: {' '.join(cmd)}")
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for line in iter(p.stdout.readline, ''):
-            if line is None:
-                continue
-            socketio.emit('flashing_status', line.strip())
-        p.wait()
-        rc = p.returncode
-        msg = '✅ Flashing completed successfully' if rc == 0 else f'⚠️ Flashing ended with return code {rc}'
-        socketio.emit('flashing_status', f'{msg} (file: {filename})')
+        is_openocd = os.path.basename(cmd[0]) == 'openocd'
+        for attempt in (1, 2):
+            rc, timed_out, hit, tail = _run_flash_once(cmd)
+            if rc == 0 and not timed_out and hit is None:
+                socketio.emit('flashing_status', f'✅ Flashing completed successfully (file: {filename})')
+                return
+            # A wedged ICDI (e.g. after the debugger crashed) fails every
+            # libusb transfer until it's replugged -- try that in software once.
+            if attempt == 1 and is_openocd and hit == 'Error TX Data':
+                reset_ok, result = _usb_reset_icdi()
+                socketio.emit('flashing_status', f'Probe not responding (Error TX Data); {result}')
+                if reset_ok:
+                    socketio.emit('flashing_status', 'Retrying flash once...')
+                    continue
+            break
+        if timed_out:
+            reason = f'timed out after {FLASH_TIMEOUT_SEC}s'
+        elif hit is not None:
+            reason = f'"{hit}" in output'
+        else:
+            reason = 'non-zero exit'
+        last = '\n'.join(tail[-8:])
+        socketio.emit('flashing_status',
+                      f'❌ Flashing FAILED ({reason}, exit code {rc}) (file: {filename})\nLast output:\n{last}')
     except Exception as e:
         socketio.emit('flashing_status', f'Error while flashing: {e}')
 
@@ -2124,6 +2213,46 @@ def _teardown_debug_session():
         _debug_openocd = None
 
 
+def _on_gdb_exit_callback():
+    """GdbSession on_exit hook: GDB died on its own (e.g. an internal error
+    while loading symbols). Tear down on the debug worker -- the callback
+    runs on the session's own reader greenthread, which stop() would kill
+    -- and free OpenOCD so it stops holding the ICDI probe."""
+    def on_exit(rc):
+        gdb = _debug_gdb
+        def job():
+            if gdb is None or _debug_gdb is not gdb:
+                return  # already torn down (debug_stop / failed debug_start)
+            print(f"[Debug] GDB exited unexpectedly (exit code {rc}); tearing down debug session")
+            _teardown_debug_session()
+            _emit_debug_event({'event': 'error', 'message': (
+                f'The debugger (GDB) crashed (exit code {rc}). The debug session has been '
+                'closed and the probe released -- click Connect to start a new session.')})
+            _emit_debug_event({'event': 'session_stopped'})
+        _debug_jobs.put(job)
+    return on_exit
+
+
+def _release_debug_probe(reason):
+    """Stop any running debug session before something else (flash, factory
+    reset) opens the same probe -- OpenOCD can't share the ICDI. Runs on the
+    debug worker so it doesn't race an in-flight debug command; blocks the
+    caller until it's done."""
+    if _debug_gdb is None and _debug_openocd is None:
+        return
+    done = eventlet.event.Event()
+    def job():
+        try:
+            if _debug_gdb is not None or _debug_openocd is not None:
+                _teardown_debug_session()
+                _emit_debug_event({'event': 'console', 'text': f'debug session closed: {reason}\n'})
+                _emit_debug_event({'event': 'session_stopped'})
+        finally:
+            done.send()
+    _debug_jobs.put(job)
+    done.wait(timeout=30)
+
+
 @socketio.on('debug_start')
 @_debug_job
 def handle_debug_start(data):
@@ -2153,7 +2282,8 @@ def handle_debug_start(data):
         else:
             _debug_openocd = OpenOCDManager(board, gdb_port=_DEBUG_GDB_PORT, adapter_serial=probe_serial)
             _debug_openocd.start()
-            gdb = GdbSession(board, _DEBUG_GDB_PORT, on_event=_emit_debug_event)
+            gdb = GdbSession(board, _DEBUG_GDB_PORT, on_event=_emit_debug_event,
+                             on_exit=_on_gdb_exit_callback())
         # Set before start(), not after: GDB auto-halts on attach (before our
         # own deliberate reset+halt even runs) and that fires an unsolicited
         # 'stopped' debug_event immediately -- the browser reacts to *any*
