@@ -87,8 +87,13 @@ class GdbCommandTimeout(RuntimeError):
     pass
 
 
+class GdbProcessExited(RuntimeError):
+    pass
+
+
 class GdbSession:
-    def __init__(self, board: BoardProfile, gdb_port: int, on_event: Callable[[dict[str, Any]], None]):
+    def __init__(self, board: BoardProfile, gdb_port: int, on_event: Callable[[dict[str, Any]], None],
+                 on_exit: Callable[[int | None], None] | None = None):
         self._board = board
         self._gdb_port = gdb_port
         # Called (from the reader greenthread) with every event this session
@@ -97,10 +102,21 @@ class GdbSession:
         # room is correct here: a Lab Pi only ever has the one active
         # booking's browser actually listening (see current_session_key).
         self._on_event = on_event
+        # Called once (from the reader greenthread, with GDB's exit code) if
+        # GDB dies on its own rather than via stop() -- so the owner can
+        # release OpenOCD/the probe and clear its session state.
+        self._on_exit = on_exit
 
         gdb_binary = _resolve_gdb_binary(board.gdb_binary)
+        # -readnow: GDB 16's lazy DWARF indexer hits an internal error
+        # (dwarf2/read.c set_lang assertion) on TI-compiler (CCS) .out files
+        # and aborts on "Load Symbols"; expanding all symtabs up front
+        # avoids that code path. -iex ... corefile no: if GDB does hit an
+        # internal error anyway, don't drop a core file in our cwd.
         self._controller = GdbController(
-            command=[gdb_binary, "--nx", "--quiet", "--interpreter=mi3"]
+            command=[gdb_binary, "--nx", "--quiet", "-readnow",
+                     "-iex", "maint set internal-error corefile no",
+                     "--interpreter=mi3"]
         )
         self._token_counter = itertools.count(1)
         self._pending: dict[int, Event] = {}
@@ -148,10 +164,31 @@ class GdbSession:
         if self._reader_greenlet is not None:
             self._reader_greenlet.kill()
             self._reader_greenlet = None
-        try:
-            self._controller.exit()
-        except Exception:
-            pass
+        # Not pygdbmi's exit(): its terminate()+wait() is the unpatched
+        # subprocess (see module docstring), so a GDB that ignores SIGTERM
+        # would block the whole eventlet hub. Poll cooperatively, then KILL.
+        proc = self._controller.gdb_process
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                for _ in range(30):
+                    if proc.poll() is not None:
+                        break
+                    eventlet.sleep(0.1)
+                else:
+                    proc.kill()
+                    proc.wait()
+            except Exception:
+                pass
+        if proc is not None:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except Exception:
+                    pass
+        self._controller.gdb_process = None
+        self._fail_pending("GDB session stopped")
 
     def load_symbols(self, elf_path: str) -> None:
         self._write(f"-file-exec-and-symbols {elf_path}", tokened=False)
@@ -282,7 +319,20 @@ class GdbSession:
 
     # ---- internals -------------------------------------------------------
 
+    def _exit_code(self) -> int | None:
+        """None while GDB is running; its returncode once it has exited."""
+        proc = self._controller.gdb_process
+        if proc is None:
+            return -1
+        return proc.poll()
+
+    def _check_alive(self) -> None:
+        rc = self._exit_code()
+        if rc is not None:
+            raise GdbProcessExited(f"GDB is not running (exit code {rc})")
+
     def _write(self, cmd: str, *, tokened: bool) -> int | None:
+        self._check_alive()
         token = None
         if tokened:
             token = next(self._token_counter)
@@ -292,6 +342,7 @@ class GdbSession:
         return token
 
     def _send_and_wait(self, cmd: str, timeout: float = REGISTER_TIMEOUT) -> dict[str, Any]:
+        self._check_alive()
         token = next(self._token_counter)
         ev = Event()
         self._pending[token] = ev
@@ -305,16 +356,40 @@ class GdbSession:
         finally:
             self._pending.pop(token, None)
 
+    def _fail_pending(self, message: str) -> None:
+        # Wake every caller blocked in _send_and_wait right away instead of
+        # letting each one sit out its full REGISTER_TIMEOUT.
+        for ev in list(self._pending.values()):
+            if not ev.ready():
+                ev.send_exception(GdbProcessExited(message))
+
     def _read_loop(self) -> None:
         while not self._stop_reader:
+            # Once GDB's stdout hits EOF, pygdbmi's select() reports it
+            # readable forever and read() returns b'' -- get_gdb_response
+            # would spin there at 100% CPU. Check the process first.
+            rc = self._exit_code()
+            if rc is not None:
+                self._handle_gdb_exit(rc)
+                return
             try:
                 responses = self._controller.get_gdb_response(timeout_sec=0.5, raise_error_on_timeout=False)
             except Exception:
                 if self._stop_reader:
                     return
+                eventlet.sleep(0.1)
                 continue
             for resp in responses:
                 self._dispatch(resp)
+
+    def _handle_gdb_exit(self, rc: int) -> None:
+        if self._stop_reader:
+            return
+        self._stop_reader = True
+        self._reader_greenlet = None
+        self._fail_pending(f"GDB exited unexpectedly (exit code {rc})")
+        if self._on_exit is not None:
+            self._on_exit(rc)
 
     def _dispatch(self, resp: dict[str, Any]) -> None:
         token = resp.get("token")
