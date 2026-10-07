@@ -1631,7 +1631,7 @@ def _run_flash_once(cmd):
 def run_flash_command(cmd, filename=None):
     try:
         # The debugger's OpenOCD holds the same probe the flasher needs.
-        _release_debug_probe('flashing firmware')
+        _release_debug_probe()
         socketio.emit('flashing_status', f"Starting: {' '.join(cmd)}")
         is_openocd = os.path.basename(cmd[0]) == 'openocd'
         for attempt in (1, 2):
@@ -2233,7 +2233,7 @@ def _on_gdb_exit_callback():
     return on_exit
 
 
-def _release_debug_probe(reason):
+def _release_debug_probe():
     """Stop any running debug session before something else (flash, factory
     reset) opens the same probe -- OpenOCD can't share the ICDI. Runs on the
     debug worker so it doesn't race an in-flight debug command; blocks the
@@ -2244,8 +2244,9 @@ def _release_debug_probe(reason):
     def job():
         try:
             if _debug_gdb is not None or _debug_openocd is not None:
+                print("[Debug] Stopping debug session to free the probe for flashing")
                 _teardown_debug_session()
-                _emit_debug_event({'event': 'console', 'text': f'debug session closed: {reason}\n'})
+                _emit_debug_event({'event': 'console', 'text': 'Debugger disconnected to free the probe for flashing.\n'})
                 _emit_debug_event({'event': 'session_stopped'})
         finally:
             done.send()
