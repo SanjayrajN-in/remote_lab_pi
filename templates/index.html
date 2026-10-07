@@ -742,7 +742,10 @@ socket.on('flashing_status', (d) => {
   flashStatus.innerText = txt;
   const m = txt.match(/(\d{1,3})%/);
   if(m) progressEl.style.width = m[1] + '%';
-  if(/complete|done|success|✅/i.test(txt)){
+  if(/❌|Flashing FAILED|Error while flashing/.test(txt)){
+    progressEl.style.width = '0%';
+    flashBtn.disabled = false; cancelFlash.disabled = true;
+  } else if(/complete|done|success|✅/i.test(txt)){
     progressEl.style.width = '100%';
     flashBtn.disabled = false; cancelFlash.disabled = true;
   }

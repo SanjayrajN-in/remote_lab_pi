@@ -17,6 +17,7 @@ import os
 import signal
 import socket
 import subprocess
+import threading
 import time
 
 from .boards import BoardProfile
@@ -74,6 +75,10 @@ class OpenOCDManager:
                     f"openocd exited early (code {self._proc.returncode}):\n{output}"
                 )
             if _port_open("127.0.0.1", self.gdb_port):
+                # stdout is a pipe nobody else reads: once its ~64 KiB buffer
+                # fills (a long or chatty session), OpenOCD blocks on write
+                # and the debug session stalls. Drain it in the background.
+                threading.Thread(target=_drain, args=(self._proc.stdout,), daemon=True).start()
                 return
             time.sleep(0.2)
 
@@ -100,6 +105,14 @@ class OpenOCDManager:
     @property
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+
+def _drain(stream) -> None:
+    try:
+        for _ in iter(stream.readline, ""):
+            pass
+    except (OSError, ValueError):
+        pass  # pipe closed by stop()
 
 
 def _port_open(host: str, port: int) -> bool:
