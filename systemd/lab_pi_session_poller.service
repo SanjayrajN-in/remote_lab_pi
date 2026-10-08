@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=abhi
-WorkingDirectory=/home/abhi/lab-pi
-EnvironmentFile=/home/abhi/lab-pi/.env
-ExecStart=/usr/bin/python3 /home/abhi/lab-pi/lab_pi_session_poller.py
+User=%i
+WorkingDirectory=__PROJECT_DIR__
+EnvironmentFile=__PROJECT_DIR__/.env
+ExecStart=/usr/bin/python3 __PROJECT_DIR__/lab_pi_session_poller.py
 Restart=always
 RestartSec=10
 
