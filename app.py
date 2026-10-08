@@ -39,7 +39,7 @@ import subprocess
 import eventlet
 eventlet.monkey_patch()
 
-import os, time, subprocess, threading, queue, tempfile, re, random, json, math, asyncio, hmac, functools, collections, glob
+import os, time, subprocess, threading, queue, tempfile, re, random, json, math, asyncio, hmac, functools, collections, glob, shutil
 import numpy as np
 from scipy.signal import medfilt, savgol_filter
 import requests
@@ -1493,6 +1493,10 @@ def ports_rest():
     return jsonify({'ports': list_serial_ports()})
 
 # ---------- FLASH ----------
+# Boards whose flash command (below) actually takes the serial port.
+_PORT_FLASHED_BOARDS = {'esp32', 'esp8266', 'arduino', 'attiny'}
+
+
 def _flash_commands(board, port, fw_path):
     """Argv lists (never a shell string) for each board's flash command, so
     `port` — which comes straight from the client — can never be parsed as
@@ -1528,13 +1532,19 @@ def flash():
     fw = request.files.get('firmware')
     if not fw:
         return jsonify({'status': 'No firmware uploaded'}), 400
+    # 'generic' (and any unknown board, which used to fall back to it) has
+    # no real flash command -- just an echo that then reported ✅.
+    if board not in _flash_commands(board, port, '') or board == 'generic':
+        msg = f'Flashing is not possible for board {board!r}: no flash command is configured for it'
+        return jsonify({'status': msg, 'error': msg}), 400
+    if _flash_busy:
+        return jsonify({'status': _FLASH_BUSY_MESSAGE}), 409
     fname = secure_filename(fw.filename)
     dest = os.path.join(UPLOAD_DIR, fname)
     fw.save(dest)
 
-    commands = _flash_commands(board, port, dest)
-    cmd = commands.get(board, commands['generic'])
-    socketio.start_background_task(run_flash_command, cmd, fname)
+    cmd = _flash_commands(board, port, dest)[board]
+    _start_flash(cmd, fname)
     return jsonify({'status': f'Flashing started for {board}', 'command': ' '.join(cmd)})
 
 
@@ -1560,6 +1570,13 @@ FLASH_TIMEOUT_SEC = 90
 # OpenOCD output that means the probe/flash failed even if it exited 0.
 # ("Error: SRST error" is normal for the Tiva ICDI and deliberately not here.)
 _FLASH_FAILURE_PATTERNS = ('Error TX Data', 'open failed')
+# The Master decides a flash's outcome by regex over each flashing_status
+# string -- failure: /^❌|Flashing FAILED|Error while flashing/i, success:
+# /complete|done|success|✅/i -- so only the one final message per flash may
+# match either. Everything before it goes through _flash_progress_text().
+_FLASH_VERDICT_TEXT = re.compile(r'done|complete|success|flashing failed|error while flashing|✅|❌', re.I)
+_FLASH_BUSY_MESSAGE = 'Another flash is already in progress on this board -- wait for it to finish.'
+_flash_busy = False
 # TI Stellaris/Tiva In-Circuit Debug Interface (EK-TM4C123GXL onboard probe)
 _ICDI_USB_ID = ('1cbe', '00fd')
 
@@ -1603,6 +1620,33 @@ def _usb_reset_icdi():
     return True, f'USB reset of ICDI probe {matches[0]} OK'
 
 
+def _flash_progress_text(text):
+    """Tool output relayed as progress: any word the Master would read as a
+    final verdict gets a zero-width space inside it (displays the same, can't
+    match), and stray ✅/❌ are spelled out. "NN%" is untouched -- the Master
+    reads it for the progress bar."""
+    def defuse(m):
+        word = m.group(0)
+        if word == '✅':
+            return '(ok)'
+        if word == '❌':
+            return '(x)'
+        return word[0] + '\u200b' + word[1:]
+    return _FLASH_VERDICT_TEXT.sub(defuse, str(text))
+
+
+def _start_flash(cmd, filename):
+    """One flash at a time: two would fight over the same probe/port and
+    interleave two final verdicts on flashing_status."""
+    global _flash_busy
+    _flash_busy = True
+    try:
+        socketio.start_background_task(run_flash_command, cmd, filename)
+    except Exception:
+        _flash_busy = False
+        raise
+
+
 def _run_flash_once(cmd):
     """Run one flash attempt, streaming output.
     Returns (rc, timed_out, failure_pattern_or_None, last_output_lines)."""
@@ -1619,7 +1663,7 @@ def _run_flash_once(cmd):
                 tail.append(line)
                 if hit is None:
                     hit = next((pat for pat in _FLASH_FAILURE_PATTERNS if pat in line), None)
-                socketio.emit('flashing_status', line)
+                socketio.emit('flashing_status', _flash_progress_text(line))
             p.wait()
     except eventlet.Timeout:
         timed_out = True
@@ -1629,50 +1673,77 @@ def _run_flash_once(cmd):
 
 
 def run_flash_command(cmd, filename=None):
+    """Runs on a background task. Always ends with exactly one final
+    flashing_status message -- starting with ✅ on success or ❌ on failure,
+    including timeouts and exceptions -- and nothing before it that the
+    Master could mistake for one (see _FLASH_VERDICT_TEXT)."""
+    global _flash_busy
+    shown_name = _flash_progress_text(filename)
+    final = None
     try:
-        # The debugger's OpenOCD holds the same probe the flasher needs.
-        _release_debug_probe()
-        socketio.emit('flashing_status', f"Starting: {' '.join(cmd)}")
-        is_openocd = os.path.basename(cmd[0]) == 'openocd'
-        for attempt in (1, 2):
-            rc, timed_out, hit, tail = _run_flash_once(cmd)
-            if rc == 0 and not timed_out and hit is None:
-                socketio.emit('flashing_status', f'✅ Flashing completed successfully (file: {filename})')
-                return
-            # A wedged ICDI (e.g. after the debugger crashed) fails every
-            # libusb transfer until it's replugged -- try that in software once.
-            if attempt == 1 and is_openocd and hit == 'Error TX Data':
-                reset_ok, result = _usb_reset_icdi()
-                socketio.emit('flashing_status', f'Probe not responding (Error TX Data); {result}')
-                if reset_ok:
-                    socketio.emit('flashing_status', 'Retrying flash once...')
-                    continue
-            break
-        if timed_out:
-            reason = f'timed out after {FLASH_TIMEOUT_SEC}s'
-        elif hit is not None:
-            reason = f'"{hit}" in output'
-        else:
-            reason = 'non-zero exit'
-        last = '\n'.join(tail[-8:])
-        socketio.emit('flashing_status',
-                      f'❌ Flashing FAILED ({reason}, exit code {rc}) (file: {filename})\nLast output:\n{last}')
+        final = _flash_with_retry(cmd, shown_name)
     except Exception as e:
-        socketio.emit('flashing_status', f'Error while flashing: {e}')
+        final = f'❌ Error while flashing: {_flash_progress_text(e)} (file: {shown_name})'
+    finally:
+        _flash_busy = False
+        final = final or f'❌ Flashing FAILED (aborted before finishing) (file: {shown_name})'
+        socketio.emit('flashing_status', final)
+        # Same verdict, structured, for a Master that doesn't want to regex
+        # the string. Sent second so string-only listeners are unaffected.
+        socketio.emit('flashing_result', {'text': final, 'final': True, 'ok': final.startswith('✅')})
+
+
+def _flash_with_retry(cmd, shown_name):
+    """Flash, streaming progress; returns the final ✅/❌ message."""
+    # The debugger's OpenOCD holds the same probe the flasher needs.
+    _release_debug_probe()
+    socketio.emit('flashing_status', _flash_progress_text(f"Starting: {' '.join(cmd)}"))
+    is_openocd = os.path.basename(cmd[0]) == 'openocd'
+    for attempt in (1, 2):
+        rc, timed_out, hit, tail = _run_flash_once(cmd)
+        if rc == 0 and not timed_out and hit is None:
+            return f'✅ Flashing completed successfully (file: {shown_name})'
+        # A wedged ICDI (e.g. after the debugger crashed) fails every
+        # libusb transfer until it's replugged -- try that in software once.
+        if attempt == 1 and is_openocd and hit == 'Error TX Data':
+            reset_ok, result = _usb_reset_icdi()
+            socketio.emit('flashing_status', _flash_progress_text(f'Probe not responding (Error TX Data); {result}'))
+            if reset_ok:
+                socketio.emit('flashing_status', 'Retrying flash once...')
+                continue
+        break
+    if timed_out:
+        reason = f'timed out after {FLASH_TIMEOUT_SEC}s'
+    elif hit is not None:
+        reason = f'"{hit}" in output'
+    else:
+        reason = 'non-zero exit'
+    last = _flash_progress_text('\n'.join(tail[-8:]))
+    return f'❌ Flashing FAILED ({reason}, exit code {rc}) (file: {shown_name})\nLast output:\n{last}'
 
 # ---------- FACTORY RESET ENDPOINT ----------
 # Expects JSON or form { "board": "esp32" }
 # Finds corresponding default firmware file under DEFAULT_FW_DIR and calls run_flash_command
 @app.route('/factory_reset', methods=['POST'])
 def factory_reset():
-    if not is_control_enabled('factory_reset'):
-        return jsonify({'error': 'Factory Reset is disabled for this session'}), 403
-    if current_session_key is None:
-        return jsonify({'error': 'No active experiment session'}), 403
     try:
         data = request.get_json(force=True)
     except:
         data = request.form.to_dict()
+    data = data if isinstance(data, dict) else {}
+    # The Master's automatic flash at session start (purpose "session_start",
+    # with a valid X-Master-Api-Key) isn't the student's Factory Reset button,
+    # so it isn't blocked by that control being disabled, and may arrive
+    # before the poller has picked up the session. Only when a key is
+    # actually configured -- _verify_master_request() lets everything
+    # through without one.
+    master_session_start = (data.get('purpose') == 'session_start'
+                            and bool(MASTER_API_KEY) and _verify_master_request())
+    if not master_session_start:
+        if not is_control_enabled('factory_reset'):
+            return jsonify({'error': 'Factory Reset is disabled for this session'}), 403
+        if current_session_key is None:
+            return jsonify({'error': 'No active experiment session'}), 403
     board = (data.get('board') or 'generic').lower()
     if not is_control_enabled('board_select'):
         board = (current_board_type or board).lower()
@@ -1692,18 +1763,36 @@ def factory_reset():
         'generic': 'generic_default.bin'
     }
 
-    fname = default_map.get(board, default_map['generic'])
+    # Everything is checked before starting, so the Master (which calls this
+    # automatically at every session start) gets a clear 4xx now rather than
+    # a 200 followed by a failure -- or worse, the 'generic' echo "flash"
+    # reporting ✅ without flashing anything.
+    if board not in default_map or board == 'generic':
+        known = ', '.join(b for b in default_map if b != 'generic')
+        return jsonify({'error': f'Factory reset is not possible for board {board!r}: no flash command '
+                                 f'is configured for it (known boards: {known})'}), 400
+
+    fname = default_map[board]
     fpath = os.path.join(DEFAULT_FW_DIR, fname)
     if not os.path.isfile(fpath):
-        return jsonify({'error': f'Default firmware not found for board {board}: expected {fpath}'}), 404
+        return jsonify({'error': f'No default firmware for {board} at {fpath}'}), 404
 
-    # choose command based on board (similar to /flash)
-    port, port_err = _resolved_flash_port(data.get('port'))
-    if port_err:
-        return jsonify({'error': port_err}), 400
+    # Only the serial-port flashers use the port; OpenOCD/mspdebug boards
+    # find their probe over USB, so don't refuse those for lack of one.
+    port = ''
+    if board in _PORT_FLASHED_BOARDS:
+        port, port_err = _resolved_flash_port(data.get('port'))
+        if port_err:
+            return jsonify({'error': f'Cannot factory reset {board}: {port_err}'}), 400
+        if port.startswith('/dev/') and not os.path.exists(port):
+            return jsonify({'error': f'Cannot factory reset {board}: port {port} not found (board unplugged?)'}), 400
     commands = _flash_commands(board, port, fpath)
-    cmd = commands.get(board, commands['generic'])
-    socketio.start_background_task(run_flash_command, cmd, fname)
+    cmd = commands[board]
+    if not shutil.which(cmd[0]):
+        return jsonify({'error': f'Cannot factory reset {board}: flash tool {cmd[0]!r} is not installed on this Lab Pi'}), 400
+    if _flash_busy:
+        return jsonify({'error': _FLASH_BUSY_MESSAGE}), 409
+    _start_flash(cmd, fname)
     return jsonify({'status': f'Factory reset started for {board}', 'command': ' '.join(cmd)})
 
 # ---------- SOP DOWNLOAD ----------
@@ -2197,15 +2286,33 @@ def _debug_job(handler):
     return wrapper
 
 
-def _teardown_debug_session():
+def _teardown_debug_session(resume_target=False):
+    """Stop GDB and OpenOCD. With resume_target, first leave the CPU running
+    (breakpoints deleted, reset-run, detach) -- the Tiva is powered over the
+    debug cable, so a target left halted stays frozen for the next student.
+    Every step is best-effort; the shutdown always happens."""
     global _debug_gdb, _debug_openocd
+    resumed = False
     if _debug_gdb is not None:
+        if resume_target:
+            try:
+                resumed = _debug_gdb.release_target()
+            except Exception as e:
+                print(f"[Debug] Error resuming target via GDB: {e}")
         try:
             _debug_gdb.stop()
         except Exception as e:
             print(f"[Debug] Error stopping GDB session: {e}")
         _debug_gdb = None
     if _debug_openocd is not None:
+        if resume_target and not resumed:
+            # GDB is gone (crashed) or couldn't resume -- ask OpenOCD directly.
+            try:
+                board = _debug_openocd.board
+                out = _debug_openocd.run_command(board.resume_monitor_cmd)
+                print(f"[Debug] Resumed target via OpenOCD: {out.strip()}")
+            except Exception as e:
+                print(f"[Debug] Error resuming target via OpenOCD: {e}")
         try:
             _debug_openocd.stop()
         except Exception as e:
@@ -2224,7 +2331,7 @@ def _on_gdb_exit_callback():
             if gdb is None or _debug_gdb is not gdb:
                 return  # already torn down (debug_stop / failed debug_start)
             print(f"[Debug] GDB exited unexpectedly (exit code {rc}); tearing down debug session")
-            _teardown_debug_session()
+            _teardown_debug_session(resume_target=True)
             _emit_debug_event({'event': 'error', 'message': (
                 f'The debugger (GDB) crashed (exit code {rc}). The debug session has been '
                 'closed and the probe released -- click Connect to start a new session.')})
@@ -2285,14 +2392,12 @@ def handle_debug_start(data):
             _debug_openocd.start()
             gdb = GdbSession(board, _DEBUG_GDB_PORT, on_event=_emit_debug_event,
                              on_exit=_on_gdb_exit_callback())
-        # Set before start(), not after: GDB auto-halts on attach (before our
-        # own deliberate reset+halt even runs) and that fires an unsolicited
-        # 'stopped' debug_event immediately -- the browser reacts to *any*
-        # 'stopped' by requesting registers/disasm/locals/watches right away
-        # (see the 'stopped' case in templates/index.html). If _debug_gdb
-        # were still None at that point, every one of those bounces back as
-        # a bogus "No active debug session" error even though the session
-        # is, from the student's perspective, mid-connect and about to work.
+        # Set before start(), not after: start() ends by emitting a 'stopped'
+        # (reason "reset"), and the browser reacts to *any* 'stopped' by
+        # requesting registers/disasm/locals/watches right away (see the
+        # 'stopped' case in templates/index.html). If _debug_gdb were still
+        # None at that point, every one of those bounces back as a bogus
+        # "No active debug session" error.
         _debug_gdb = gdb
         gdb.start()
     except Exception as e:
@@ -2314,7 +2419,9 @@ def handle_debug_start(data):
 @socketio.on('debug_stop')
 @_debug_job
 def handle_debug_stop(data=None):
-    _teardown_debug_session()
+    # Harmless with no session (the Master sends this on every relay
+    # teardown): _teardown_debug_session() is then a no-op.
+    _teardown_debug_session(resume_target=True)
     emit('debug_event', {'event': 'session_stopped'})
 
 

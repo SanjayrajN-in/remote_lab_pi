@@ -42,7 +42,52 @@ class GdbLike(Protocol):
 _FIRE_AND_FORGET = {"continue", "step", "step_over", "pause", "reset"}
 
 
+class BadArgument(ValueError):
+    """Client sent a missing/invalid field; reported as an 'error' event."""
+
+
+def _int_arg(msg: dict[str, Any], key: str, default: int | None = None, minimum: int = 1) -> int:
+    value = msg.get(key, default)
+    # bool is an int subclass -- true/false is never a meaningful id/length.
+    if isinstance(value, bool) or value is None:
+        raise BadArgument(f"{key} must be a number, got {value!r}")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if not isinstance(value, int) or value < minimum:
+        raise BadArgument(f"{key} must be a whole number >= {minimum}, got {value!r}")
+    return value
+
+
+def _str_arg(msg: dict[str, Any], key: str) -> str:
+    value = msg.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise BadArgument(f"{key} is required, got {value!r}")
+    # These are interpolated into one GDB/MI command line; a newline would
+    # let a client append a second, arbitrary GDB command.
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in value):
+        raise BadArgument(f"{key} contains control characters")
+    return value
+
+
+def _gdb_error(resp: dict[str, Any]) -> str | None:
+    """GDB's error text if this MI reply is an ^error, else None."""
+    if resp.get("message") == "error":
+        return (resp.get("payload") or {}).get("msg") or "unknown GDB error"
+    return None
+
+
 def handle_command(session: GdbLike, msg: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(msg, dict):
+        return {"event": "error", "message": f"debug_command must be an object, got {type(msg).__name__}"}
+    try:
+        return _handle(session, msg)
+    except BadArgument as e:
+        return {"event": "error", "message": f"{msg.get('cmd')}: {e}"}
+
+
+def _handle(session: GdbLike, msg: dict[str, Any]) -> dict[str, Any] | None:
     cmd = msg.get("cmd")
 
     if cmd == "continue":
@@ -62,24 +107,37 @@ def handle_command(session: GdbLike, msg: dict[str, Any]) -> dict[str, Any] | No
         return None
 
     if cmd == "set_breakpoint":
-        resp = session.set_breakpoint(msg["addr"])
-        bkpt = resp.get("payload", {}).get("bkpt", {})
-        return {"event": "breakpoint", "action": "set", "id": bkpt.get("number"), "addr": bkpt.get("addr")}
+        addr = _str_arg(msg, "addr")
+        resp = session.set_breakpoint(addr)
+        err = _gdb_error(resp)
+        bkpt = (resp.get("payload") or {}).get("bkpt") or {}
+        number = str(bkpt.get("number", ""))
+        if err is None and not number.isdigit():
+            err = "GDB did not return a breakpoint number"
+        if err is not None:
+            # Never a 'set' for a breakpoint that doesn't exist.
+            return {"event": "error", "message": f"Could not set breakpoint at {addr}: {err}"}
+        return {"event": "breakpoint", "action": "set", "id": int(number), "addr": bkpt.get("addr")}
 
     if cmd == "remove_breakpoint":
-        session.remove_breakpoint(int(msg["id"]))
-        return {"event": "breakpoint", "action": "removed", "id": msg["id"]}
+        bp_id = _int_arg(msg, "id")
+        err = _gdb_error(session.remove_breakpoint(bp_id) or {})
+        # "No breakpoint number N." means it's already gone -- same end
+        # state the client asked for, so still confirm the removal.
+        if err is not None and "No breakpoint number" not in err:
+            return {"event": "error", "message": f"Could not remove breakpoint {bp_id}: {err}"}
+        return {"event": "breakpoint", "action": "removed", "id": bp_id}
 
     if cmd == "read_registers":
         values = session.read_registers()
         return {"event": "registers", "values": values}
 
     if cmd == "read_memory":
-        result = session.read_memory(msg["addr"], int(msg["length"]))
+        result = session.read_memory(_str_arg(msg, "addr"), _int_arg(msg, "length"))
         return {"event": "memory", **result}
 
     if cmd == "disassemble":
-        lines = session.disassemble(msg["addr"], int(msg.get("count", 20)))
+        lines = session.disassemble(_str_arg(msg, "addr"), _int_arg(msg, "count", default=20))
         return {"event": "disasm", "lines": lines}
 
     if cmd == "read_locals":
@@ -87,14 +145,15 @@ def handle_command(session: GdbLike, msg: dict[str, Any]) -> dict[str, Any] | No
         return {"event": "locals", "variables": variables}
 
     if cmd == "add_watch":
-        result = session.add_watch(msg["expr"])
+        result = session.add_watch(_str_arg(msg, "expr"))
         if "error" in result:
             return {"event": "error", "message": result["error"]}
         return {"event": "watch", "action": "added", **result}
 
     if cmd == "remove_watch":
-        session.remove_watch(msg["name"])
-        return {"event": "watch", "action": "removed", "name": msg["name"]}
+        name = _str_arg(msg, "name")
+        session.remove_watch(name)
+        return {"event": "watch", "action": "removed", "name": name}
 
     if cmd == "update_watches":
         changes = session.update_watches()

@@ -28,6 +28,10 @@ class BoardProfile:
     # implements one transport but auto-selection guesses the other (e.g.
     # TI's ICDI driver is JTAG-only; OpenOCD defaults it to SWD and fails).
     openocd_transport: str | None = None
+    # OpenOCD command debug_stop uses to leave the target running for the
+    # next student -- a reset (not just a resume) so it restarts cleanly
+    # from the flashed firmware's entry point instead of mid-breakpoint.
+    resume_monitor_cmd: str = "reset run"
 
 
 BOARDS: dict[str, BoardProfile] = {

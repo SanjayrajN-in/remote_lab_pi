@@ -137,6 +137,16 @@ class GdbSession:
 
         self._reader_greenlet = None
         self._stop_reader = False
+        # Set by release_target(): the session is being torn down, so the
+        # *stopped/console records its own interrupt/reset produce must not
+        # reach the browser (a 'stopped' would make it fire read_registers
+        # etc. at a session that's about to be gone).
+        self._closing = False
+        # Set while start()/reset() run: GDB's own halt-on-attach *stopped,
+        # the interrupt's *stopped and OpenOCD's "halted due to debug-request
+        # ... pc:" monitor output all duplicate the single 'stopped' (reason
+        # "reset") that reset() emits itself once the PC is known.
+        self._muted = False
         self._symbols_loaded = False
         # GDB's var-object names (e.g. "var2") aren't the expression text,
         # so track expr alongside each one for display / re-sending to the UI.
@@ -151,6 +161,7 @@ class GdbSession:
         # stops on its own, so pause/reset/anything else sent meanwhile is
         # silently queued and never delivered.
         self._write("-gdb-set mi-async on", tokened=False)
+        self._muted = True
         self._write(f"-target-select remote localhost:{self._gdb_port}", tokened=False)
         # A freshly attached session otherwise inherits whatever halt/run
         # state the CPU was left in by the previous session — students
@@ -190,6 +201,40 @@ class GdbSession:
         self._controller.gdb_process = None
         self._fail_pending("GDB session stopped")
 
+    def release_target(self) -> bool:
+        """Leave the CPU running before the session is stopped: the Tiva is
+        powered over the debug cable, so a target left halted at a
+        breakpoint stays frozen until someone power-cycles it. Every step is
+        best-effort -- one failing never skips the rest, and the caller
+        still stops GDB/OpenOCD afterwards. Returns True if the target was
+        resumed (reset-run or a fallback)."""
+        self._closing = True
+
+        def attempt(name: str, fn: Callable[[], Any]) -> bool:
+            try:
+                fn()
+                return True
+            except Exception as e:
+                print(f"[Debug] release_target: {name} failed: {e}")
+                return False
+
+        # Breakpoint and monitor commands are refused while the target runs,
+        # so halt it first -- but only if it IS running: an -exec-interrupt
+        # sent to an already-halted target still reaches OpenOCD as a Ctrl-C,
+        # which it holds as a pending halt and applies the moment the core
+        # runs again (i.e. right after the reset-run below), re-freezing it.
+        if self._target_running() is not False:
+            attempt("interrupt", lambda: self._write("-exec-interrupt", tokened=False))
+        attempt("delete breakpoints", lambda: self._console_retrying("delete"))
+        resumed = (
+            attempt(self._board.resume_monitor_cmd,
+                    lambda: self._console_retrying(f"monitor {self._board.resume_monitor_cmd}"))
+            or attempt("continue", lambda: self._ok_or_raise(self._send_and_wait("-exec-continue", timeout=2.0)))
+            or attempt("monitor resume", lambda: self._console_retrying("monitor resume"))
+        )
+        attempt("detach", lambda: self._ok_or_raise(self._send_and_wait("-target-detach", timeout=2.0)))
+        return resumed
+
     def load_symbols(self, elf_path: str) -> None:
         self._write(f"-file-exec-and-symbols {elf_path}", tokened=False)
         self._symbols_loaded = True
@@ -212,7 +257,11 @@ class GdbSession:
         self._write(cmd, tokened=False)
 
     def pause(self) -> None:
-        self._write("-exec-interrupt", tokened=False)
+        # Only if running: interrupting an already-halted target arms a
+        # stale halt in OpenOCD (see release_target) that freezes the next
+        # Continue straight away.
+        if self._target_running() is not False:
+            self._write("-exec-interrupt", tokened=False)
 
     def reset(self, halt: bool = True) -> None:
         # GDB refuses to run "monitor" commands while the target is
@@ -223,7 +272,23 @@ class GdbSession:
         # out in testing under real hardware jitter) — retry the monitor
         # command instead until it stops erroring, which adapts to
         # however long the actual halt takes.
-        self._write("-exec-interrupt", tokened=False)
+        # Only interrupt a running target, though: GDB halts it on attach,
+        # and an -exec-interrupt sent to an already-halted target still
+        # reaches OpenOCD as a Ctrl-C it holds as a pending halt -- which made
+        # the student's first Continue after Connect stop again immediately
+        # ("signal-received").
+        self._muted = True
+        try:
+            self._reset_target(halt)
+        finally:
+            self._muted = False
+        if halt:
+            pc = self.read_registers().get("pc", "")
+            self._on_event({"event": "stopped", "reason": "reset", "pc": pc, "frame": {"addr": pc}, "file": None, "line": None})
+
+    def _reset_target(self, halt: bool) -> None:
+        if self._target_running() is not False:
+            self._write("-exec-interrupt", tokened=False)
         cmd = "reset halt" if halt else "reset"
         monitor_cmd = f'-interpreter-exec console "monitor {cmd}"'
         for _ in range(15):
@@ -241,8 +306,6 @@ class GdbSession:
             # "maintenance flush register-cache" forces GDB to re-read
             # every register from the target instead of trusting its cache.
             self._send_and_wait('-interpreter-exec console "maintenance flush register-cache"')
-            pc = self.read_registers().get("pc", "")
-            self._on_event({"event": "stopped", "reason": "reset", "pc": pc, "frame": {"addr": pc}, "file": None, "line": None})
 
     # ---- request/response commands --------------------------------------
 
@@ -356,6 +419,37 @@ class GdbSession:
         finally:
             self._pending.pop(token, None)
 
+    def _target_running(self) -> bool | None:
+        """GDB's view of the target: True running, False stopped, None if
+        it can't tell (no thread yet, GDB unresponsive)."""
+        try:
+            resp = self._send_and_wait("-thread-info", timeout=2.0)
+        except Exception:
+            return None
+        states = {t.get("state") for t in (resp.get("payload") or {}).get("threads", [])}
+        if "running" in states:
+            return True
+        return False if states else None
+
+    @staticmethod
+    def _ok_or_raise(resp: dict[str, Any]) -> dict[str, Any]:
+        if resp.get("message") == "error":
+            raise RuntimeError((resp.get("payload") or {}).get("msg", "GDB error"))
+        return resp
+
+    def _console_retrying(self, cmd: str, attempts: int = 10) -> None:
+        """Run a CLI command, retrying while GDB still says the target is
+        running (an -exec-interrupt that hasn't landed yet) -- same reason
+        as reset()'s retry loop."""
+        mi = f'-interpreter-exec console "{cmd}"'
+        for i in range(attempts):
+            resp = self._send_and_wait(mi, timeout=2.0)
+            if resp.get("message") != "error":
+                return
+            if i < attempts - 1:
+                eventlet.sleep(0.2)
+        self._ok_or_raise(resp)
+
     def _fail_pending(self, message: str) -> None:
         # Wake every caller blocked in _send_and_wait right away instead of
         # letting each one sit out its full REGISTER_TIMEOUT.
@@ -397,6 +491,8 @@ class GdbSession:
             ev = self._pending[token]
             if not ev.ready():
                 ev.send(resp)
+            return
+        if self._closing or self._muted:
             return
         self._on_event(_to_event(resp))
 

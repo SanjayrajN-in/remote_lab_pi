@@ -46,6 +46,15 @@ class MockGdbSession:
         if self._pending_continue is not None:
             self._pending_continue.cancel()
 
+    def release_target(self) -> bool:
+        # Mirrors GdbSession.release_target(): breakpoints gone, target
+        # left running, and no further events pushed to the browser.
+        if self._pending_continue is not None:
+            self._pending_continue.cancel()
+            self._pending_continue = None
+        self._on_event = lambda payload: None
+        return True
+
     def load_symbols(self, elf_path: str) -> None:
         self._on_event({"event": "console", "text": f"[mock] pretending to load symbols from {elf_path}\n"})
         self._symbols_loaded = True

@@ -29,10 +29,12 @@ class OpenOCDStartupError(RuntimeError):
 
 class OpenOCDManager:
     def __init__(self, board: BoardProfile, gdb_port: int = 3333, telnet_port: int = 4444,
-                 adapter_serial: str | None = None):
+                 adapter_serial: str | None = None, tcl_port: int = 6666):
         self.board = board
         self.gdb_port = gdb_port
         self.telnet_port = telnet_port
+        # OpenOCD's own default; set explicitly so run_command() knows it.
+        self.tcl_port = tcl_port
         # Selects a specific probe by its USB serial number when a Lab Pi has
         # more than one debug-capable board attached at once -- otherwise
         # OpenOCD just grabs whichever matching adapter it finds first. Not
@@ -58,6 +60,7 @@ class OpenOCDManager:
             "-f", self.board.openocd_target,
             "-c", f"gdb port {self.gdb_port}",
             "-c", f"telnet port {self.telnet_port}",
+            "-c", f"tcl port {self.tcl_port}",
         ]
         self._proc = subprocess.Popen(
             cmd,
@@ -101,6 +104,22 @@ class OpenOCDManager:
                 pass
         finally:
             self._proc = None
+
+    def run_command(self, command: str, timeout: float = 5.0) -> str:
+        """Run one OpenOCD command over its Tcl RPC port (each message is
+        terminated by 0x1a) and return its output. Used to resume the target
+        when GDB is gone or couldn't do it itself."""
+        if not self.running:
+            raise RuntimeError("OpenOCD is not running")
+        with socket.create_connection(("127.0.0.1", self.tcl_port), timeout=timeout) as sock:
+            sock.sendall(command.encode() + b"\x1a")
+            buf = b""
+            while not buf.endswith(b"\x1a"):
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        return buf.rstrip(b"\x1a").decode(errors="replace")
 
     @property
     def running(self) -> bool:
