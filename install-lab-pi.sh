@@ -31,10 +31,16 @@ NC='\033[0m'
 
 # Resolve these up front so every later step (including the ustreamer build,
 # which cd's back into the project dir) can rely on them being set.
-# The project dir is wherever this script is run from, not a hardcoded
-# path -- this way .env, the venv, and the systemd services all end up
-# next to the code you actually have checked out.
-PROJECT_DIR="$(pwd)"
+# The project dir is the directory this script lives in, not a hardcoded
+# path or the caller's cwd -- so `bash ~/remote_lab_pi/install-lab-pi.sh`
+# run from ~ still targets the checkout. When piped (`curl ... | bash`)
+# there is no script file, so fall back to the current directory.
+SCRIPT_SRC="${BASH_SOURCE[0]:-}"
+if [ -n "$SCRIPT_SRC" ] && [ -f "$SCRIPT_SRC" ]; then
+    PROJECT_DIR="$(cd "$(dirname "$SCRIPT_SRC")" && pwd)"
+else
+    PROJECT_DIR="$(pwd)"
+fi
 CURRENT_USER=$(whoami)
 CURRENT_HOME=$(eval echo ~"$CURRENT_USER")
 
@@ -87,6 +93,14 @@ prompt_read() {
     read -r -p "$__prompt" "$__var" < /dev/tty || true
 }
 
+# Read KEY's value from an existing .env (last occurrence, surrounding
+# double quotes stripped) without sourcing it, so re-running the installer
+# offers the current values as defaults instead of resetting them.
+env_get() {
+    [ -f "$PROJECT_DIR/.env" ] || return 0
+    sed -n "s/^$1=//p" "$PROJECT_DIR/.env" | tail -n 1 | sed 's/^"\(.*\)"$/\1/'
+}
+
 # ============================================================================
 # Step 1: Get Configuration
 # ============================================================================
@@ -114,19 +128,41 @@ fi
 # Get hostname for default values
 DETECTED_HOSTNAME=$(get_hostname)
 
+# Defaults: values from an existing .env (re-run) win over generated ones
+EXISTING_MAC=$(env_get VLAB_PI_MAC)
+EXISTING_API_KEY=$(env_get MASTER_API_KEY)
+EXISTING_LOCATION=$(env_get LOCATION)
+DEFAULT_LAB_PI_ID=$(env_get VLAB_PI_ID)
+DEFAULT_LAB_PI_ID=${DEFAULT_LAB_PI_ID:-lab-$DETECTED_HOSTNAME}
+DEFAULT_LAB_PI_NAME=$(env_get VLAB_PI_NAME)
+DEFAULT_LAB_PI_NAME=${DEFAULT_LAB_PI_NAME:-Lab Pi $DETECTED_HOSTNAME}
+DEFAULT_EXPERIMENT_ID=$(env_get EXPERIMENT_ID)
+DEFAULT_EXPERIMENT_ID=${DEFAULT_EXPERIMENT_ID:-1}
+DEFAULT_MASTER_URL=$(env_get MASTER_URL)
+DEFAULT_MASTER_URL=${DEFAULT_MASTER_URL:-http://10.114.62.73:5000}
+
+if [ -f "$PROJECT_DIR/.env" ]; then
+    echo "Existing $PROJECT_DIR/.env found -- its values are offered as defaults."
+    echo ""
+fi
+
 # Lab Pi ID - use hostname as default
 if [ -z "$LAB_PI_ID" ]; then
-    prompt_read "Enter Lab Pi ID (default: lab-$DETECTED_HOSTNAME): " LAB_PI_ID
-    LAB_PI_ID=${LAB_PI_ID:-lab-$DETECTED_HOSTNAME}
+    prompt_read "Enter Lab Pi ID (default: $DEFAULT_LAB_PI_ID): " LAB_PI_ID
+    LAB_PI_ID=${LAB_PI_ID:-$DEFAULT_LAB_PI_ID}
 fi
 
 # Lab Pi Name - use hostname as default
 if [ -z "$LAB_PI_NAME" ]; then
-    prompt_read "Enter Lab Pi Name (default: Lab Pi $DETECTED_HOSTNAME): " LAB_PI_NAME
-    LAB_PI_NAME=${LAB_PI_NAME:-Lab Pi $DETECTED_HOSTNAME}
+    prompt_read "Enter Lab Pi Name (default: $DEFAULT_LAB_PI_NAME): " LAB_PI_NAME
+    LAB_PI_NAME=${LAB_PI_NAME:-$DEFAULT_LAB_PI_NAME}
 fi
 
-# MAC Address
+# MAC Address - keep the existing one unless the user overrides it
+if [ -z "$LAB_PI_MAC" ] && [ -n "$EXISTING_MAC" ]; then
+    prompt_read "Enter MAC address (default: $EXISTING_MAC): " LAB_PI_MAC
+    LAB_PI_MAC=${LAB_PI_MAC:-$EXISTING_MAC}
+fi
 if [ -z "$LAB_PI_MAC" ]; then
     echo "MAC address not provided. Attempting to detect..."
     DETECTED_MAC=$(get_mac_address)
@@ -144,24 +180,34 @@ fi
 
 # Experiment ID - default to 1
 if [ -z "$EXPERIMENT_ID" ]; then
-    prompt_read "Enter Experiment ID (default: 1): " EXPERIMENT_ID
-    EXPERIMENT_ID=${EXPERIMENT_ID:-1}
+    prompt_read "Enter Experiment ID (default: $DEFAULT_EXPERIMENT_ID): " EXPERIMENT_ID
+    EXPERIMENT_ID=${EXPERIMENT_ID:-$DEFAULT_EXPERIMENT_ID}
 fi
 
 # Master URL - use common default
 if [ -z "$MASTER_URL" ]; then
-    prompt_read "Enter Master Pi URL (default: http://10.114.62.73:5000): " MASTER_URL
-    MASTER_URL=${MASTER_URL:-http://10.114.62.73:5000}
+    prompt_read "Enter Master Pi URL (default: $DEFAULT_MASTER_URL): " MASTER_URL
+    MASTER_URL=${MASTER_URL:-$DEFAULT_MASTER_URL}
 fi
 
-# Master API Key (optional)
+# Master API Key (optional) - never echo an existing key back
 if [ -z "$MASTER_API_KEY" ]; then
-    prompt_read "Enter Master API Key (optional, press Enter to skip): " MASTER_API_KEY
+    if [ -n "$EXISTING_API_KEY" ]; then
+        prompt_read "Enter Master API Key (press Enter to keep the existing key): " MASTER_API_KEY
+        MASTER_API_KEY=${MASTER_API_KEY:-$EXISTING_API_KEY}
+    else
+        prompt_read "Enter Master API Key (optional, press Enter to skip): " MASTER_API_KEY
+    fi
 fi
 
 # Location (optional)
 if [ -z "$LOCATION" ]; then
-    prompt_read "Enter Location (optional, e.g., Lab Room 101): " LOCATION
+    if [ -n "$EXISTING_LOCATION" ]; then
+        prompt_read "Enter Location (default: $EXISTING_LOCATION): " LOCATION
+        LOCATION=${LOCATION:-$EXISTING_LOCATION}
+    else
+        prompt_read "Enter Location (optional, e.g., Lab Room 101): " LOCATION
+    fi
 fi
 
 echo ""
@@ -251,7 +297,7 @@ if [ -d "$PROJECT_DIR/.git" ]; then
 elif [ -z "$(find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 ! -name "$(basename "$0")" -print -quit 2>/dev/null)" ]; then
     echo "Current directory is empty -- cloning repository into it..."
     # Replace with your actual repository URL
-    REPO_URL=${REPO_URL:-"https://github.com/Abhilash1575/remote_lab_pi.git"}
+    REPO_URL=${REPO_URL:-"https://github.com/SanjayrajN-in/remote_lab_pi.git"}
     # `git clone` refuses a target dir that already holds this script, so
     # clone to a scratch dir and move the checkout (dotfiles included) up.
     CLONE_TMP="$(mktemp -d)"
@@ -300,6 +346,15 @@ fi
 # ============================================================================
 echo -e "${YELLOW}Step 8: Creating Lab Pi configuration...${NC}"
 
+# Back up any existing .env first: the managed keys below are rewritten,
+# and any other keys it held are carried over afterwards.
+OLD_ENV=""
+if [ -f "$PROJECT_DIR/.env" ]; then
+    OLD_ENV="$PROJECT_DIR/.env.bak"
+    cp "$PROJECT_DIR/.env" "$OLD_ENV"
+    echo "Backed up existing .env to $OLD_ENV"
+fi
+
 # Create .env file for Lab Pi
 cat > "$PROJECT_DIR/.env" << EOF
 # Lab Pi Configuration
@@ -312,14 +367,24 @@ MASTER_URL=$MASTER_URL
 MASTER_API_KEY=$MASTER_API_KEY
 LOCATION="$LOCATION"
 
-# Session Poller - Admin Pi URL for session polling
+# Session Poller - Admin Pi URL for session polling. The poller reads
+# LAB_PI_ID (not VLAB_PI_ID) and falls back to the hostname without it.
 ADMIN_PI_URL=$MASTER_URL
+LAB_PI_ID=$LAB_PI_ID
 
 # Server settings
 LAB_PORT=5001
 LAB_HOST=0.0.0.0
 LAB_DEBUG=False
 EOF
+
+if [ -n "$OLD_ENV" ]; then
+    MANAGED_KEYS='VLAB_PI_TYPE|VLAB_PI_ID|VLAB_PI_NAME|VLAB_PI_MAC|EXPERIMENT_ID|MASTER_URL|MASTER_API_KEY|LOCATION|ADMIN_PI_URL|LAB_PI_ID|LAB_PORT|LAB_HOST|LAB_DEBUG'
+    EXTRA_KEYS=$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$OLD_ENV" | grep -vE "^($MANAGED_KEYS)=" || true)
+    if [ -n "$EXTRA_KEYS" ]; then
+        printf '\n# Preserved from previous .env\n%s\n' "$EXTRA_KEYS" >> "$PROJECT_DIR/.env"
+    fi
+fi
 
 echo "Configuration saved to $PROJECT_DIR/.env"
 
@@ -387,7 +452,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$USER
+User=$CURRENT_USER
 WorkingDirectory=$PROJECT_DIR
 EnvironmentFile=$PROJECT_DIR/.env
 ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/app.py
@@ -403,6 +468,8 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable vlab-lab-pi.service
+# restart (not start) so re-running after a git pull picks up new code
+sudo systemctl restart vlab-lab-pi.service
 
 # ============================================================================
 # Step 8b: Setup Session Poller Service (for hardware control)
@@ -410,28 +477,14 @@ sudo systemctl enable vlab-lab-pi.service
 echo -e "${YELLOW}Step 9b: Setting up session poller service...${NC}"
 
 # Copy session poller files if they exist
-if [ -f "$PROJECT_DIR/lab_pi_session_poller.py" ]; then
-    # Create service file with resolved paths
-    sudo tee /etc/systemd/system/lab_pi_session_poller.service > /dev/null << EOFSERVICE
-[Unit]
-Description=Lab Pi Session Poller
-After=network.target
+if [ -f "$PROJECT_DIR/lab_pi_session_poller.py" ] && [ -f "$PROJECT_DIR/systemd/lab_pi_session_poller.service" ]; then
+    sudo cp "$PROJECT_DIR/systemd/lab_pi_session_poller.service" /etc/systemd/system/
+    sudo sed -i "s|__PROJECT_DIR__|$PROJECT_DIR|g" /etc/systemd/system/lab_pi_session_poller.service
+    sudo sed -i "s|%i|$CURRENT_USER|g" /etc/systemd/system/lab_pi_session_poller.service
 
-[Service]
-Type=simple
-User=$CURRENT_USER
-WorkingDirectory=$PROJECT_DIR
-EnvironmentFile=$PROJECT_DIR/.env
-ExecStart=/usr/bin/python3 $PROJECT_DIR/lab_pi_session_poller.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOFSERVICE
-    
     sudo systemctl daemon-reload
     sudo systemctl enable lab_pi_session_poller || true
+    sudo systemctl restart lab_pi_session_poller || true
     echo -e "${GREEN}✅ Session poller service installed (User: $CURRENT_USER)${NC}"
 else
     echo -e "${YELLOW}⚠️ Session poller not found - will use main app for session control${NC}"
@@ -441,7 +494,7 @@ fi
 # Step 8: Hardware Setup (GPIO)
 # ============================================================================
 echo -e "${YELLOW}Step 10: Setting up GPIO permissions...${NC}"
-sudo usermod -a -G gpio $USER
+sudo usermod -a -G gpio "$CURRENT_USER"
 
 # ============================================================================
 # Step 11: Install Audio/Video Streaming Services
@@ -513,13 +566,10 @@ echo "  - Name: $LAB_PI_NAME"
 echo "  - Experiment: $EXPERIMENT_ID"
 echo "  - Master: $MASTER_URL"
 echo ""
-echo "To start the Lab Pi service:"
-echo "  sudo systemctl start vlab-lab-pi.service"
-echo ""
-echo "To check status:"
+echo "The Lab Pi service has been (re)started. To check status:"
 echo "  sudo systemctl status vlab-lab-pi.service"
 echo ""
 echo "To view logs:"
-echo "  journalctl -u vlab-lab-pi.service -f"
+echo "  tail -f /var/log/vlab-lab-pi.log"
 echo ""
 echo -e "${YELLOW}IMPORTANT: After starting, check Master Pi to verify registration!${NC}"
